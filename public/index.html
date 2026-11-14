@@ -1,0 +1,809 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>slime</title>
+<style>
+html, body { margin: 0; height: 100%; background: #fafafa; overflow: hidden; }
+canvas { position: fixed; left: 0; top: 0; width: 100vw; height: 100vh; }
+#view { touch-action: none; cursor: crosshair; opacity: 0; transition: opacity 0.35s ease; }
+#hint {
+  position: fixed; left: 0; right: 0; bottom: 28px; text-align: center;
+  font: 13px/1 system-ui, sans-serif; letter-spacing: 0.04em; color: #9a9a9e;
+  pointer-events: none; user-select: none; transition: opacity 0.8s ease;
+}
+</style>
+</head>
+<body>
+<canvas id="ghost"></canvas>
+<canvas id="view"></canvas>
+<div id="hint">move close to tease it, grab it to stretch tear and throw it</div>
+<script id="frag" type="x-shader/x-fragment">#version 300 es
+precision highp float;
+
+uniform vec2 uRes;
+uniform float uTime;
+uniform vec4 uBlob[16];
+uniform vec4 uSegA[32];
+uniform vec4 uSegB[32];
+uniform vec3 uBound;
+uniform vec3 uPoke;
+uniform int uSegs;
+out vec4 outCol;
+
+uint bm;
+uint sm;
+
+float hash(vec3 p) {
+  p = fract(p * 0.3183099 + 0.1);
+  p *= 17.0;
+  return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+
+float noise(vec3 x) {
+  vec3 i = floor(x);
+  vec3 f = fract(x);
+  f = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+  return mix(
+    mix(mix(hash(i), hash(i + vec3(1, 0, 0)), f.x), mix(hash(i + vec3(0, 1, 0)), hash(i + vec3(1, 1, 0)), f.x), f.y),
+    mix(mix(hash(i + vec3(0, 0, 1)), hash(i + vec3(1, 0, 1)), f.x), mix(hash(i + vec3(0, 1, 1)), hash(i + vec3(1, 1, 1)), f.x), f.y),
+    f.z);
+}
+
+float smin(float a, float b, float k) {
+  float h = max(k - abs(a - b), 0.0) / k;
+  return min(a, b) - h * h * k * 0.25;
+}
+
+void cull(vec3 o, vec3 d, float pad) {
+  bm = 0u;
+  sm = 0u;
+  for (int i = 0; i < 16; i++) {
+    vec3 c = uBlob[i].xyz - o;
+    c -= d * max(dot(c, d), 0.0);
+    float r = uBlob[i].w + pad;
+    if (dot(c, c) < r * r) bm |= 1u << uint(i);
+  }
+  for (int i = 0; i < 32; i++) {
+    if (i >= uSegs) break;
+    vec3 a = uSegA[i].xyz;
+    vec3 b = uSegB[i].xyz;
+    vec3 c = (a + b) * 0.5 - o;
+    c -= d * max(dot(c, d), 0.0);
+    float r = length(b - a) * 0.5 + max(uSegA[i].w, uSegB[i].w) + pad;
+    if (dot(c, c) < r * r) sm |= 1u << uint(i);
+  }
+}
+
+float body(vec3 p) {
+  float d = 1e5;
+  for (int i = 0; i < 16; i++) {
+    if ((bm & (1u << uint(i))) == 0u) continue;
+    vec4 b = uBlob[i];
+    d = smin(d, length(p - b.xyz) - b.w, 0.16);
+  }
+  return d;
+}
+
+float strands(vec3 p) {
+  float s = 1e5;
+  for (int i = 0; i < 32; i++) {
+    if (i >= uSegs) break;
+    if ((sm & (1u << uint(i))) == 0u) continue;
+    vec4 a = uSegA[i];
+    vec4 b = uSegB[i];
+    vec3 pa = p - a.xyz;
+    vec3 ba = b.xyz - a.xyz;
+    float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-5), 0.0, 1.0);
+    s = smin(s, length(pa - ba * h) - mix(a.w, b.w, h), 0.13);
+  }
+  return s;
+}
+
+float shape(vec3 p) {
+  float d = body(p);
+  if (sm != 0u) d = smin(d, strands(p), 0.2);
+  return d;
+}
+
+float map(vec3 p) {
+  float d = body(p);
+  if (d < 0.3) {
+    vec3 q = p * 1.6 + vec3(0.0, 0.0, uTime * 0.12);
+    d -= (noise(q + sin(q.yzx * 1.7 + uTime * 0.3) * 0.45) - 0.5) * 0.19;
+  }
+  if (sm != 0u) d = smin(d, strands(p), 0.2);
+  vec2 pk = p.xy - uPoke.xy;
+  d += uPoke.z * 0.2 * exp(-dot(pk, pk) * 9.0);
+  return smin(d, p.z + 0.1, 0.45);
+}
+
+float fine(vec3 p) {
+  return map(p) - (noise(p * 5.5 + vec3(uTime * 0.15)) - 0.5) * 0.035;
+}
+
+vec3 normal(vec3 p) {
+  vec3 n = vec3(0.0);
+  for (int i = 0; i < 4; i++) {
+    vec3 e = 2.0 * vec3(float(((i + 3) >> 1) & 1), float((i >> 1) & 1), float(i & 1)) - 1.0;
+    n += e * fine(p + e * 0.003);
+  }
+  return normalize(n);
+}
+
+float box(vec2 q, vec2 b) {
+  vec2 a = abs(q);
+  return smoothstep(b.x + 0.05, b.x - 0.05, a.x) * smoothstep(b.y + 0.05, b.y - 0.05, a.y);
+}
+
+vec3 env(vec3 d) {
+  float c = 0.012;
+  c += 0.9 * smoothstep(0.12, -0.15, d.z);
+  c += 0.22 * smoothstep(0.75, 0.1, d.z);
+  if (d.z > 0.05) {
+    vec2 q = d.xy / d.z;
+    c += 70.0 * box(q - vec2(-1.3, 0.9), vec2(0.45, 0.8));
+    c += 50.0 * box(q - vec2(1.6, -0.3), vec2(0.3, 0.9));
+    c += 35.0 * box(q - vec2(0.2, 2.4), vec2(1.6, 0.14));
+    c += 25.0 * box(q - vec2(-0.4, -1.9), vec2(0.9, 0.1));
+  }
+  return vec3(c * 0.97, c, c * 1.02);
+}
+
+float shadow(vec3 fp, vec3 l) {
+  float occ = 0.0;
+  for (int i = 1; i <= 3; i++) {
+    float h = 0.25 * float(i);
+    occ += clamp((h - shape(fp + l * h)) / h, 0.0, 1.0) * 0.333;
+  }
+  return 1.0 - 0.72 * occ;
+}
+
+void main() {
+  float span = min(uRes.x, uRes.y);
+  vec2 uv = (gl_FragCoord.xy - 0.5 * uRes) / span;
+  vec3 ro = vec3(0.0, -2.4, 6.6);
+  vec3 f = normalize(-ro);
+  vec3 r = normalize(cross(f, vec3(0.0, 1.0, 0.0)));
+  vec3 u = cross(r, f);
+  vec3 rd = normalize(uv.x * r + uv.y * u + 1.7 * f);
+  vec3 l = normalize(vec3(0.3, 0.25, 1.0));
+
+  float tFloor = -ro.z / rd.z;
+  vec3 fp = ro + rd * tFloor;
+  float fd = length(fp.xy - uBound.xy) - uBound.z;
+
+  bool hit = false;
+  vec3 p = fp;
+  if (fd < 0.6) {
+    cull(ro, rd, 0.45);
+    if ((bm | sm) != 0u) {
+      float t = (1.25 - ro.z) / rd.z;
+      for (int i = 0; i < 48; i++) {
+        p = ro + rd * t;
+        float d = map(p);
+        if (d < 0.0015) { hit = true; break; }
+        t += d * 0.7;
+        if (t > tFloor) break;
+      }
+    }
+  }
+
+  vec3 col = vec3(0.955, 0.957, 0.96);
+  float alpha = hit ? 1.0 - exp(-p.z / max(-rd.z, 0.3) * 10.0) : 0.0;
+  if (!hit && fd < 1.0) cull(fp + l * 0.5, vec3(0.0), 1.0);
+  if (alpha < 0.985 && fd < 1.0 && (bm | sm) != 0u) col *= shadow(fp, l);
+  if (hit) {
+    vec3 n = normal(p);
+    vec3 rf = reflect(rd, n);
+    vec3 refl = env(rf);
+    float d0 = 0.0;
+    float occ = 0.0;
+    float sca = 1.0;
+    for (int i = 0; i <= 3; i++) {
+      float h = 0.06 * float(i);
+      float d = body(p + n * h);
+      if (i == 0) {
+        d0 = d;
+      } else {
+        occ += (h - d) * sca;
+        sca *= 0.7;
+      }
+    }
+    float ao = clamp(1.0 - 2.6 * occ, 0.0, 1.0);
+
+    cull(p, rf, 0.12);
+    float st = 0.1;
+    for (int i = 0; i < 7; i++) {
+      vec3 q = p + rf * st;
+      if (q.z > 1.25 || q.z < 0.0) break;
+      float d = body(q) - d0;
+      if (d < -0.01) { refl = vec3(0.015); break; }
+      st += max(d, 0.05);
+    }
+
+    vec3 under = col * 0.5 * (1.0 - alpha);
+    float fr = 0.04 + 0.96 * pow(1.0 - max(dot(n, -rd), 0.0), 5.0);
+    vec3 spec = 1.0 - exp(-refl * fr * mix(0.2, 1.0, ao) * 1.1);
+    col = under + spec + 0.004;
+  }
+
+  outCol = vec4(pow(col, vec3(0.4545)), 1.0);
+}
+</script>
+<script id="post" type="x-shader/x-fragment">#version 300 es
+precision highp float;
+
+uniform sampler2D uTex;
+uniform vec2 uRes;
+uniform float uTime;
+out vec4 outCol;
+
+void main() {
+  vec2 px = 1.0 / uRes;
+  vec2 uv = gl_FragCoord.xy * px;
+  vec3 lu = vec3(0.299, 0.587, 0.114);
+  vec3 mid = texture(uTex, uv).rgb;
+  float lNW = dot(texture(uTex, uv + vec2(-1.0, -1.0) * px).rgb, lu);
+  float lNE = dot(texture(uTex, uv + vec2(1.0, -1.0) * px).rgb, lu);
+  float lSW = dot(texture(uTex, uv + vec2(-1.0, 1.0) * px).rgb, lu);
+  float lSE = dot(texture(uTex, uv + vec2(1.0, 1.0) * px).rgb, lu);
+  float lM = dot(mid, lu);
+  float lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));
+  float lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));
+
+  vec3 col = mid;
+  if (lMax - lMin > 0.03) {
+    vec2 dir = vec2(-((lNW + lNE) - (lSW + lSE)), (lNW + lSW) - (lNE + lSE));
+    float red = max((lNW + lNE + lSW + lSE) * 0.03125, 1.0 / 128.0);
+    dir = clamp(dir / (min(abs(dir.x), abs(dir.y)) + red), -8.0, 8.0) * px;
+    vec3 a = 0.5 * (texture(uTex, uv + dir * (1.0 / 3.0 - 0.5)).rgb + texture(uTex, uv + dir * (2.0 / 3.0 - 0.5)).rgb);
+    vec3 b = a * 0.5 + 0.25 * (texture(uTex, uv - dir * 0.5).rgb + texture(uTex, uv + dir * 0.5).rgb);
+    float lB = dot(b, lu);
+    col = lB < lMin || lB > lMax ? a : b;
+  }
+
+  vec3 h = fract(vec3(gl_FragCoord.xy, uTime) * 0.3183099 + 0.1) * 17.0;
+  col += (fract(h.x * h.y * h.z * (h.x + h.y + h.z)) - 0.5) / 255.0;
+  outCol = vec4(col, 1.0);
+}
+</script>
+<script>
+const canvas = document.getElementById('view')
+const ghost = document.getElementById('ghost')
+const hint = document.getElementById('hint')
+const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, powerPreference: 'high-performance' })
+
+if (!gl) {
+  hint.textContent = 'webgl2 is not available in this browser'
+  ghost.remove()
+} else {
+  const vertSrc = `#version 300 es
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`
+
+  const parallel = gl.getExtension('KHR_parallel_shader_compile')
+  const fragSrc = document.getElementById('frag').textContent
+  const ghostCtx = ghost.getContext('2d')
+
+  const build = src => {
+    const pr = gl.createProgram()
+    for (const [type, text] of [[gl.VERTEX_SHADER, vertSrc], [gl.FRAGMENT_SHADER, src]]) {
+      const sh = gl.createShader(type)
+      gl.shaderSource(sh, text)
+      gl.compileShader(sh)
+      gl.attachShader(pr, sh)
+    }
+    gl.linkProgram(pr)
+    return pr
+  }
+
+  const check = pr => {
+    if (gl.getProgramParameter(pr, gl.LINK_STATUS)) return
+    const logs = gl.getAttachedShaders(pr).map(sh => gl.getShaderInfoLog(sh))
+    throw new Error(gl.getProgramInfoLog(pr) + logs.join(''))
+  }
+
+  const locate = pr => ({
+    res: gl.getUniformLocation(pr, 'uRes'),
+    time: gl.getUniformLocation(pr, 'uTime'),
+    blob: gl.getUniformLocation(pr, 'uBlob'),
+    segA: gl.getUniformLocation(pr, 'uSegA'),
+    segB: gl.getUniformLocation(pr, 'uSegB'),
+    bound: gl.getUniformLocation(pr, 'uBound'),
+    poke: gl.getUniformLocation(pr, 'uPoke'),
+    segs: gl.getUniformLocation(pr, 'uSegs')
+  })
+
+  const prog = build(fragSrc)
+  const post = build(document.getElementById('post').textContent)
+  let u = null
+  let ready = false
+
+  const uPostRes = gl.getUniformLocation(post, 'uRes')
+  const uPostTime = gl.getUniformLocation(post, 'uTime')
+
+  const sceneTex = gl.createTexture()
+  const sceneFbo = gl.createFramebuffer()
+  gl.bindTexture(gl.TEXTURE_2D, sceneTex)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+  gl.clearColor(Math.pow(0.955, 0.4545), Math.pow(0.957, 0.4545), Math.pow(0.96, 0.4545), 1)
+
+  const blobCount = 16
+  const tendrilCount = 5
+  const linkMax = 8
+  const segMax = 32
+  const sizes = [0.66, 0.6, 0.56, 0.52, 0.46, 0.44, 0.42, 0.4, 0.38, 0.36, 0.3, 0.3, 0.28, 0.27, 0.26, 0.25]
+  const blobs = []
+  const tendrils = []
+  const cands = []
+  const linked = new Uint8Array(blobCount * blobCount)
+  const blobData = new Float32Array(blobCount * 4)
+  const segAData = new Float32Array(segMax * 4)
+  const segBData = new Float32Array(segMax * 4)
+
+  for (let i = 0; i < blobCount; i++) {
+    const a = Math.random() * Math.PI * 2
+    const d = Math.sqrt(Math.random()) * 0.9
+    blobs.push({
+      x: Math.cos(a) * d, y: Math.sin(a) * d, vx: 0, vy: 0, fx: 0, fy: 0,
+      r: sizes[i], ph: Math.random() * 20, held: false, ox: 0, oy: 0
+    })
+  }
+
+  for (let i = 0; i < tendrilCount; i++) {
+    const root = blobs[i + 5]
+    tendrils.push({
+      root, x: root.x, y: root.y, z: root.r * 0.42, vx: 0, vy: 0, vz: 0,
+      reach: 1.3 + i * 0.3, k: 55 + i * 13
+    })
+  }
+
+  const ptr = { x: 0, y: 0, on: false, down: false }
+  const anchor = { x: 0, y: 0, vx: 0, vy: 0 }
+  const center = { x: 0, y: 0 }
+  const poke = { x: 0, y: 0, s: 0, v: 0 }
+  const bounds = { x: 2, y: 1 }
+  const clip = { x: 0, y: 0, w: 1, h: 1 }
+  const camY = -2.4, camZ = 6.6, focal = 1.7
+  const camLen = Math.hypot(camY, camZ)
+  const fwdY = -camY / camLen, fwdZ = -camZ / camLen
+  let grab = false
+  let segCount = 0
+
+  const toWorld = e => {
+    const span = Math.min(innerWidth, innerHeight)
+    const ux = (e.clientX - innerWidth / 2) / span
+    const uy = (innerHeight / 2 - e.clientY) / span
+    const dy = uy * -fwdZ + focal * fwdY
+    const dz = uy * fwdY + focal * fwdZ
+    const t = -camZ / dz
+    ptr.x = ux * t
+    ptr.y = camY + dy * t
+  }
+
+  const release = () => {
+    if (!ptr.down) return
+    ptr.down = false
+    let vx = 0, vy = 0
+    for (const b of blobs) {
+      b.held = false
+      vx += b.vx
+      vy += b.vy
+    }
+    grab = false
+    vx /= blobCount
+    vy /= blobCount
+    const sp = Math.hypot(vx, vy)
+    const cap = sp > 9 ? 9 / sp : 1
+    anchor.vx = vx * cap
+    anchor.vy = vy * cap
+  }
+
+  addEventListener('pointermove', e => {
+    toWorld(e)
+    ptr.on = true
+  })
+  canvas.addEventListener('pointerdown', e => {
+    toWorld(e)
+    ptr.on = true
+    ptr.down = true
+    hint.style.opacity = 0
+    anchor.vx = 0
+    anchor.vy = 0
+    grab = false
+    for (const b of blobs) {
+      const dx = b.x - ptr.x
+      const dy = b.y - ptr.y
+      const d = Math.hypot(dx, dy) + 1e-4
+      if (d < b.r * 0.9 + 0.15) {
+        b.held = true
+        b.ox = dx * 0.6
+        b.oy = dy * 0.6
+        grab = true
+      } else if (d < 1.3) {
+        const kick = 1.3 * (1 - d / 1.3)
+        b.vx += dx / d * kick
+        b.vy += dy / d * kick
+      }
+    }
+  })
+  addEventListener('pointerup', e => {
+    release()
+    if (e.pointerType !== 'mouse') ptr.on = false
+  })
+  addEventListener('pointercancel', () => {
+    release()
+    ptr.on = false
+  })
+  document.addEventListener('pointerleave', () => {
+    release()
+    ptr.on = false
+  })
+
+  const step = (dt, t) => {
+    for (const b of blobs) {
+      let fx = (anchor.x - b.x) * 0.7
+      let fy = (anchor.y - b.y) * 0.7
+      fx += Math.sin(t * 0.7 + b.ph) * 0.7
+      fy += Math.cos(t * 0.53 + b.ph * 1.7) * 0.7
+      if (b.held) {
+        fx += (ptr.x + b.ox - b.x) * 45 - b.vx * 8
+        fy += (ptr.y + b.oy - b.y) * 45 - b.vy * 8
+      } else if (ptr.on) {
+        const dx = ptr.x - b.x
+        const dy = ptr.y - b.y
+        const d2 = dx * dx + dy * dy
+        const d = Math.sqrt(d2) + 1e-4
+        const pull = ptr.down && !grab ? 14 * Math.exp(-d2 / 6) : 4 * Math.exp(-d2 / 1.4)
+        const amt = Math.min(d, 1) * pull / d
+        fx += dx * amt
+        fy += dy * amt
+      }
+      b.fx = fx
+      b.fy = fy
+    }
+
+    for (let i = 0; i < blobCount; i++) {
+      const a = blobs[i]
+      for (let j = i + 1; j < blobCount; j++) {
+        const b = blobs[j]
+        const idx = i * blobCount + j
+        const dx = b.x - a.x
+        const dy = b.y - a.y
+        const d = Math.hypot(dx, dy) + 1e-4
+        const rest = (a.r + b.r) * 0.7
+        if (d < rest * 1.15) linked[idx] = 1
+        let f = 0
+        if (d < rest) {
+          f = (d - rest) * 16
+        } else if (linked[idx]) {
+          if (d > rest * 2.3 + 0.35) linked[idx] = 0
+          else f = Math.min((d - rest) * 5, 2.5)
+        }
+        a.fx += dx / d * f
+        a.fy += dy / d * f
+        b.fx -= dx / d * f
+        b.fy -= dy / d * f
+      }
+    }
+
+    const damp = Math.exp(-3.5 * dt)
+    let cx = 0, cy = 0
+    for (const b of blobs) {
+      b.vx = anchor.vx + (b.vx + b.fx * dt - anchor.vx) * damp
+      b.vy = anchor.vy + (b.vy + b.fy * dt - anchor.vy) * damp
+      b.x += b.vx * dt
+      b.y += b.vy * dt
+      cx += b.x
+      cy += b.y
+    }
+    center.x = cx / blobCount
+    center.y = cy / blobCount
+
+    if (ptr.down) {
+      const amt = Math.min(1, 4 * dt)
+      anchor.x += (center.x - anchor.x) * amt
+      anchor.y += (center.y - anchor.y) * amt
+    } else {
+      const slide = Math.exp(-1.6 * dt)
+      anchor.x += anchor.vx * dt
+      anchor.y += anchor.vy * dt
+      anchor.vx *= slide
+      anchor.vy *= slide
+    }
+    if (Math.abs(anchor.x) > bounds.x) {
+      anchor.x = Math.sign(anchor.x) * bounds.x
+      if (anchor.vx * anchor.x > 0) anchor.vx *= -0.35
+    }
+    if (Math.abs(anchor.y) > bounds.y) {
+      anchor.y = Math.sign(anchor.y) * bounds.y
+      if (anchor.vy * anchor.y > 0) anchor.vy *= -0.35
+    }
+
+    if (ptr.down) {
+      poke.x = ptr.x
+      poke.y = ptr.y
+    }
+    poke.v += (((ptr.down ? 1 : 0) - poke.s) * 220 - poke.v * 10) * dt
+    poke.s += poke.v * dt
+
+    for (let i = 0; i < tendrilCount; i++) {
+      const tn = tendrils[i]
+      const root = tn.root
+      let tx = root.x, ty = root.y, tz = root.r * 0.42
+      if (ptr.on && !grab) {
+        const d = Math.hypot(ptr.x - root.x, ptr.y - root.y)
+        if (d < tn.reach * (ptr.down ? 1.5 : 1)) {
+          const a = t * 1.3 + i * 1.257
+          tx = ptr.x + Math.cos(a) * 0.14
+          ty = ptr.y + Math.sin(a) * 0.14
+          tz = 0.14
+        }
+      }
+      const c = Math.sqrt(tn.k) * 0.9
+      tn.vx += ((tx - tn.x) * tn.k - tn.vx * c) * dt
+      tn.vy += ((ty - tn.y) * tn.k - tn.vy * c) * dt
+      tn.vz += ((tz - tn.z) * tn.k - tn.vz * c) * dt
+      tn.x += tn.vx * dt
+      tn.y += tn.vy * dt
+      tn.z += tn.vz * dt
+    }
+  }
+
+  const seg = (ax, ay, az, ar, bx, by, bz, br) => {
+    const o = segCount * 4
+    segAData[o] = ax
+    segAData[o + 1] = ay
+    segAData[o + 2] = az
+    segAData[o + 3] = ar
+    segBData[o] = bx
+    segBData[o + 1] = by
+    segBData[o + 2] = bz
+    segBData[o + 3] = br
+    segCount++
+  }
+
+  const pack = t => {
+    let rad = 0
+    for (let i = 0; i < blobCount; i++) {
+      const b = blobs[i]
+      const r = b.r * (1 + 0.06 * Math.sin(t * 1.1 + b.ph))
+      blobData[i * 4] = b.x
+      blobData[i * 4 + 1] = b.y
+      blobData[i * 4 + 2] = r * 0.42
+      blobData[i * 4 + 3] = r
+      rad = Math.max(rad, Math.hypot(b.x - center.x, b.y - center.y) + r + 0.15)
+    }
+
+    segCount = 0
+    let out = false
+    let px = 0, py = 0, pz = 0
+    for (let i = 0; i < tendrilCount; i++) {
+      const tn = tendrils[i]
+      const root = tn.root
+      const rz = root.r * 0.42
+      const dx = tn.x - root.x
+      const dy = tn.y - root.y
+      const len2 = dx * dx + dy * dy
+      if (len2 < 0.012) continue
+      const wob = Math.sin(t * 2.3 + i * 1.9) * 0.1
+      const th = 1 / (1 + Math.sqrt(len2) * 0.4)
+      const mx = (root.x + tn.x) / 2 - dy * wob
+      const my = (root.y + tn.y) / 2 + dx * wob
+      const mz = (rz + tn.z) / 2 + 0.05
+      seg(root.x, root.y, rz, 0.19 * th, mx, my, mz, 0.08 * th)
+      seg(mx, my, mz, 0.08 * th, tn.x, tn.y, tn.z, 0.045 * th)
+      if (out) seg(px, py, pz, 0.028, mx, my, mz, 0.028)
+      out = true
+      px = mx
+      py = my
+      pz = mz
+      rad = Math.max(rad, Math.hypot(tn.x - center.x, tn.y - center.y) + 0.2)
+    }
+
+    cands.length = 0
+    for (let i = 0; i < blobCount; i++) {
+      const a = blobs[i]
+      for (let j = i + 1; j < blobCount; j++) {
+        if (!linked[i * blobCount + j]) continue
+        const b = blobs[j]
+        const d = Math.hypot(b.x - a.x, b.y - a.y)
+        const rest = (a.r + b.r) * 0.7
+        if (d < rest * 1.25) continue
+        const mx = (a.x + b.x) / 2
+        const my = (a.y + b.y) / 2
+        let open = 1e5
+        for (const c of blobs) open = Math.min(open, Math.hypot(mx - c.x, my - c.y) - c.r)
+        if (open < -0.2) continue
+        cands.push({ a, b, mx, my, open, s: Math.min(1, (d - rest) / (rest * 1.3 + 0.35)) })
+      }
+    }
+    if (cands.length > linkMax) cands.sort((p, q) => q.open - p.open)
+    const links = Math.min(cands.length, linkMax)
+    for (let i = 0; i < links; i++) {
+      const c = cands[i]
+      const az = c.a.r * 0.42
+      const bz = c.b.r * 0.42
+      const end = Math.min(c.a.r, c.b.r) * 0.55 * (1 - 0.4 * c.s)
+      const mr = 0.2 * Math.pow(1 - c.s, 1.3) + 0.012
+      const mz = (az + bz) / 2 * (1 - 0.5 * c.s)
+      seg(c.a.x, c.a.y, az, end, c.mx, c.my, mz, mr)
+      seg(c.mx, c.my, mz, mr, c.b.x, c.b.y, bz, end)
+    }
+
+    gl.uniform1i(u.segs, segCount)
+    gl.uniform4fv(u.blob, blobData)
+    gl.uniform4fv(u.segA, segAData)
+    gl.uniform4fv(u.segB, segBData)
+    gl.uniform3f(u.bound, center.x, center.y, rad)
+    gl.uniform3f(u.poke, poke.x, poke.y, poke.s)
+
+    const span = Math.min(canvas.width, canvas.height)
+    const reach = rad + 1
+    let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9
+    for (let i = 0; i < 8; i++) {
+      const wx = center.x + (i & 1 ? reach : -reach)
+      const wy = center.y + (i & 2 ? reach : -reach) - camY
+      const wz = (i & 4 ? 1.25 : 0) - camZ
+      const depth = wy * fwdY + wz * fwdZ
+      const sx = wx * focal / depth * span + canvas.width / 2
+      const sy = (wy * -fwdZ + wz * fwdY) * focal / depth * span + canvas.height / 2
+      x0 = Math.min(x0, sx)
+      y0 = Math.min(y0, sy)
+      x1 = Math.max(x1, sx)
+      y1 = Math.max(y1, sy)
+    }
+    clip.x = Math.max(0, Math.floor(x0) - 2)
+    clip.y = Math.max(0, Math.floor(y0) - 2)
+    clip.w = Math.max(0, Math.min(canvas.width, Math.ceil(x1) + 2) - clip.x)
+    clip.h = Math.max(0, Math.min(canvas.height, Math.ceil(y1) + 2) - clip.y)
+  }
+
+  const drawGhost = () => {
+    ghost.width = innerWidth
+    ghost.height = innerHeight
+    const span = Math.min(innerWidth, innerHeight)
+    ghostCtx.fillStyle = '#0c0c0c'
+    ghostCtx.shadowColor = 'rgba(0, 0, 0, 0.22)'
+    ghostCtx.shadowBlur = span * 0.05
+    ghostCtx.shadowOffsetY = span * 0.012
+    ghostCtx.beginPath()
+    for (const b of blobs) {
+      const wy = b.y - camY
+      const wz = b.r * 0.42 - camZ
+      const k = focal / (wy * fwdY + wz * fwdZ) * span
+      const sx = b.x * k + innerWidth / 2
+      const sy = innerHeight / 2 - (wy * -fwdZ + wz * fwdY) * k
+      ghostCtx.moveTo(sx + b.r * k, sy)
+      ghostCtx.arc(sx, sy, b.r * k, 0, Math.PI * 2)
+    }
+    ghostCtx.fill()
+  }
+
+  let scale = 0.5
+  const resize = () => {
+    canvas.width = Math.round(innerWidth * scale)
+    canvas.height = Math.round(innerHeight * scale)
+    gl.bindTexture(gl.TEXTURE_2D, sceneTex)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, canvas.width, canvas.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, sceneFbo)
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, sceneTex, 0)
+    gl.viewport(0, 0, canvas.width, canvas.height)
+    const span = Math.min(innerWidth, innerHeight)
+    bounds.x = Math.max(0.3, innerWidth / 2 / span * camLen / focal - 1.1)
+    bounds.y = Math.max(0.3, innerHeight / 2 / span * camLen / focal - 1)
+  }
+  addEventListener('resize', resize)
+  resize()
+
+  const probe = new Uint8Array(4)
+  const gaps = []
+  let last = performance.now()
+  let count = 0
+  let cost = 0
+  let interval = 16.7
+  let slow = 0
+  let frames = 0
+  let stopped = false
+
+  addEventListener('pagehide', () => {
+    stopped = true
+    const lose = gl.getExtension('WEBGL_lose_context')
+    if (lose) lose.loseContext()
+  })
+  addEventListener('pageshow', e => {
+    if (e.persisted) location.reload()
+  })
+
+  const frame = now => {
+    if (stopped) return
+    const gap = now - last
+    last = now
+    const dt = Math.min(gap / 1000, 1 / 30)
+    const t = now / 1000
+
+    if (!ready) {
+      const done = !parallel || (gl.getProgramParameter(prog, parallel.COMPLETION_STATUS_KHR) && gl.getProgramParameter(post, parallel.COMPLETION_STATUS_KHR))
+      if (!done) {
+        step(dt / 2, t)
+        step(dt / 2, t)
+        drawGhost()
+        requestAnimationFrame(frame)
+        return
+      }
+      check(prog)
+      check(post)
+      u = locate(prog)
+      ready = true
+      canvas.style.opacity = 1
+      canvas.addEventListener('transitionend', () => ghost.remove(), { once: true })
+    }
+    count++
+
+    const tuning = count <= 16
+    const timed = tuning && count > 10
+    if (tuning && count > 2) gaps.push(gap)
+    if (!tuning) {
+      frames++
+      if (gap > interval * 1.6) slow++
+      if (frames === 40) {
+        if (slow > 16 && scale > 0.35) {
+          scale = Math.max(0.35, scale * 0.8)
+          resize()
+        }
+        frames = 0
+        slow = 0
+      }
+    }
+
+    step(dt / 2, t)
+    step(dt / 2, t)
+
+    const began = performance.now()
+    gl.bindFramebuffer(gl.FRAMEBUFFER, sceneFbo)
+    gl.disable(gl.SCISSOR_TEST)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+    gl.useProgram(prog)
+    pack(t)
+    gl.enable(gl.SCISSOR_TEST)
+    gl.scissor(clip.x, clip.y, clip.w, clip.h)
+    gl.uniform2f(u.res, canvas.width, canvas.height)
+    gl.uniform1f(u.time, t)
+    gl.drawArrays(gl.TRIANGLES, 0, 3)
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    gl.disable(gl.SCISSOR_TEST)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+    gl.enable(gl.SCISSOR_TEST)
+    gl.useProgram(post)
+    gl.uniform2f(uPostRes, canvas.width, canvas.height)
+    gl.uniform1f(uPostTime, t)
+    gl.drawArrays(gl.TRIANGLES, 0, 3)
+
+    if (timed) {
+      gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, probe)
+      cost += (performance.now() - began) / 6
+    }
+    if (count === 16) {
+      gaps.sort((a, b) => a - b)
+      interval = Math.min(17, Math.max(4, gaps[gaps.length >> 1]))
+      const fit = scale * Math.sqrt(interval * 0.42 / Math.max(cost, 0.05))
+      scale = Math.max(0.35, Math.min(1, devicePixelRatio || 1, fit))
+      if (scale > 0.9) scale = Math.min(1, devicePixelRatio || 1)
+      resize()
+    }
+    requestAnimationFrame(frame)
+  }
+  drawGhost()
+  requestAnimationFrame(frame)
+}
+</script>
+</body>
+</html>
